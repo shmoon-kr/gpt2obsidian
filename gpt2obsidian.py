@@ -384,7 +384,7 @@ def main():
             body = "```json\n" + raw + "\n```\n"
             chunks = get_chunks(body, args.chunk_chars)
             for idx, ch in enumerate(chunks, 1):
-                name = f"{date_prefix}_{idx:03d}_{title}.md"
+                name = f"{date_prefix}{idx:03d}_{title}.md"
                 target = ensure_unique(notes_dir / name)
 
                 # 프런트매터 구성
