@@ -5,6 +5,17 @@
 # ex) python .\gpt2obsidian.py --src "E:\OneDrive\ChatbotGame\GPT\Threads\20250815" --prefix-date --copy --subfolder "Archive\\ChatGPT_20250815" --attachments "_attachments\\"
 # ap.add_argument("--vault", default="G:\\내 드라이브\\Obsidian\\DarkLord\\", help="Obsidian Vault 루트 경로")
 
+#!/usr/bin/env python3
+# gpt2obsidian.py
+# 목적: ChatGPT 내보내기 JSON → "대화별 작은 md 파일"로 분할 저장 (합본 생성 없음)
+#      + (UPD) 요약은 별도 파일을 만들지 않고 프런트매터 summary에만 저장
+#      + (NEW) 자동 태그/수동 태그 지원
+#
+# 예)
+#  python .\gpt2obsidian.py --src "E:\export" --vault "D:\Vault" \
+#    --subfolder "ChatGPT" --attachments "_attachments" --prefix-date --copy \
+#    --summarize --model gpt-4o-mini --auto-tags --tags "chatgpt,work"
+
 import argparse
 import json
 import os
@@ -13,6 +24,14 @@ import shutil
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional, List
+
+# ---- (선택) .env 자동 로드 ----
+try:
+    from dotenv import load_dotenv, find_dotenv
+    load_dotenv(find_dotenv(usecwd=True) or ".env")
+except Exception:
+    pass
 
 ATTACHMENT_EXTS = {
     ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg",
@@ -49,16 +68,22 @@ def ensure_unique(path: Path) -> Path:
             return cand
         i += 1
 
-def build_fm(title, original_filename=None, extra=None):
+def build_fm_dict(title, original_filename=None, extra=None):
     fm = {"title": title, "created": now_iso(), "source": "ChatGPT"}
     if original_filename: fm["original_filename"] = original_filename
     if extra: fm.update(extra)
+    return fm
+
+def dump_frontmatter(fm: dict) -> str:
     lines = ["---"]
     for k, v in fm.items():
         if isinstance(v, list):
-            lines.append(f"{k}: [{', '.join(v)}]")
+            # 태그/리스트
+            safe_items = [str(x).replace("\n"," ").strip() for x in v]
+            lines.append(f"{k}: [{', '.join(safe_items)}]")
         else:
-            lines.append(f"{k}: {v}")
+            v_str = str(v).replace("\n", "\\n")
+            lines.append(f"{k}: {v_str}")
     lines.append("---\n")
     return "\n".join(lines)
 
@@ -195,6 +220,84 @@ def md_from_conv(conv):
         lines.append("")
     return "\n".join(lines).strip() + "\n"
 
+# --------- 요약(제목/본문) 생성 ---------
+
+def _openai_chat_complete(prompt: str, model: str = "gpt-4o-mini", max_tokens: int = 256) -> Optional[str]:
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        return None
+    import requests, time as _t
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": "You are a concise Korean writing assistant."},
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 0.2,
+        "top_p": 0.9,
+        "max_tokens": max_tokens
+    }
+    for attempt in range(3):
+        try:
+            r = requests.post(url, headers=headers, json=payload, timeout=60)
+            if r.status_code == 200:
+                return r.json()["choices"][0]["message"]["content"].strip()
+            if r.status_code in (429, 500, 502, 503):
+                _t.sleep(1.2 * (attempt + 1)); continue
+            break
+        except Exception:
+            _t.sleep(1.2 * (attempt + 1))
+    return None
+
+def summarize_block_kor(text: str, model: str) -> tuple[str, str]:
+    MAX = 14000
+    text4 = text[:9000] + "\n...\n" + text[-4000:] if len(text) > MAX else text
+
+    title_prompt = "다음 한국어 문서의 핵심을 1줄 제목(35자 이내)으로 작성:\n\n" + text4
+    body_prompt  = "다음 한국어 문서를 5~8줄로 간결히 요약(불릿X, 단락형):\n\n" + text4
+
+    title = _openai_chat_complete(title_prompt, model=model, max_tokens=64)
+    summ  = _openai_chat_complete(body_prompt,  model=model, max_tokens=360)
+
+    if title and summ:
+        return title.strip(), summ.strip()
+
+    # --- 로컬 폴백 ---
+    first_line = next((ln.strip() for ln in text.splitlines() if ln.strip()), "대화 요약")
+    if len(first_line) > 30: first_line = first_line[:30] + "…"
+    parts = re.split(r"(?<=[\.!?。…])\s+", text.strip())
+    if len(parts) >= 6:
+        summ_local = " ".join(parts[:6])
+    else:
+        summ_local = text[:600]
+    return first_line, summ_local.strip()
+
+# --------- 태그 추론 ---------
+
+KEYWORD_TAGS = [
+    (r"\bMTG\b|매직더개더링|매직 더 개더링", "mtg"),
+    (r"무자비의 경기장", "무자비의경기장"),
+    (r"\b릴\b|릴리스 녹타", "릴"),
+    (r"\bAWS\b|EC2|S3|ELB", "aws"),
+    (r"\bObsidian\b|옵시디언", "obsidian"),
+    (r"\bCustom GPT\b|커스텀 GPT|프롬프트", "prompt"),
+    (r"라노벨|웹소설", "novel"),
+    (r"\bAR\b|\bVR\b", "xr"),
+]
+
+def infer_tags(text: str, base: List[str]) -> List[str]:
+    tags = set(x.strip() for x in base if x.strip())
+    for pat, tag in KEYWORD_TAGS:
+        if re.search(pat, text, flags=re.IGNORECASE):
+            tags.add(tag)
+    # 항상 들어갈 기본 태그
+    tags.add("chatgpt")
+    return sorted(tags)
+
+# --------- 분할 ---------
+
 def split_text_chunks(text: str, max_chars: int):
     if max_chars is None:
         return [text]
@@ -222,11 +325,12 @@ def split_text_chunks(text: str, max_chars: int):
     return final
 
 def get_chunks(text: str, max_chars):
-    """max_chars=None이면 분할 없이 반환."""
     return split_text_chunks(text, max_chars)
 
+# --------- 메인 파이프라인 ---------
+
 def main():
-    ap = argparse.ArgumentParser(description="ChatGPT JSON → 개별 작은 MD, 첨부는 이동(심플).")
+    ap = argparse.ArgumentParser(description="ChatGPT JSON → 개별 작은 MD, 첨부 이동(심플) + (옵션) 요약/태그")
     ap.add_argument("--src", required=True, help="소스 폴더 (ChatGPT 내보내기 JSON/첨부)")
     ap.add_argument("--vault", default="G:\\내 드라이브\\Obsidian\\DarkLord\\", help="Obsidian Vault 루트")
     ap.add_argument("--subfolder", default="ChatGPT", help="노트 저장 하위 폴더")
@@ -236,6 +340,13 @@ def main():
     ap.add_argument("--glob", default="*.json", help="처리할 JSON 패턴 (기본: *.json)")
     ap.add_argument("--chunk-chars", type=int, default=None, help="노트 최대 글자 수(없으면 분할 없음)")
     ap.add_argument("--embed-for-attachments", action="store_true", help="첨부 임베드 노트 생성")
+
+    # 요약/태그
+    ap.add_argument("--summarize", action="store_true", help="OpenAI 사용해 각 노트 요약 생성(프런트매터 summary에 저장)")
+    ap.add_argument("--model", default="gpt-4o-mini", help="요약용 OpenAI 모델")
+    ap.add_argument("--auto-tags", action="store_true", help="본문 키워드 기반 자동 태그 추가")
+    ap.add_argument("--tags", default="", help="쉼표로 구분된 수동 태그 (예: 'work,diary')")
+
     args = ap.parse_args()
 
     src_dir = Path(os.path.expanduser(args.src)).resolve()
@@ -253,6 +364,8 @@ def main():
 
     date_prefix = datetime.now().strftime("%Y-%m-%d_") if args.prefix_date else ""
 
+    manual_tags = [t.strip() for t in args.tags.split(",")] if args.tags else []
+
     # 1) JSON 처리
     json_files = list(src_dir.glob(args.glob))
     processed = 0
@@ -266,41 +379,72 @@ def main():
 
         convs = parse_chat_items(data)
         if not convs:
-            # 구조 미인식: 원문을 코드블록으로라도 보존 (여기서도 chunk None-safe)
+            # 구조 미인식 → 원문을 코드블록으로라도 보존
             title = slugify(jf.stem)
             body = "```json\n" + raw + "\n```\n"
-            for idx, ch in enumerate(get_chunks(body, args.chunk_chars), 1):
-                name = f"{date_prefix}{title}" + (f"-{idx}" if idx > 1 else "") + ".md"
+            chunks = get_chunks(body, args.chunk_chars)
+            for idx, ch in enumerate(chunks, 1):
+                name = f"{date_prefix}_{idx:03d}_{title}.md"
                 target = ensure_unique(notes_dir / name)
-                target.write_text(build_fm(title, jf.name) + ch, encoding="utf-8")
+
+                # 프런트매터 구성
+                extra = {"original_filename": jf.name}
+                fm = build_fm_dict(title, jf.name, extra)
+
+                # 요약/태그
+                if args.summarize:
+                    _, summary = summarize_block_kor(ch, model=args.model)
+                    fm["summary"] = summary
+                if args.auto_tags:
+                    fm["tags"] = infer_tags(ch, manual_tags)
+                elif manual_tags:
+                    fm["tags"] = manual_tags
+
+                target.write_text(dump_frontmatter(fm) + ch, encoding="utf-8")
                 print(f"[대화원문] {jf.name} → {target.relative_to(vault_dir)}")
                 processed += 1
+            # 원본 정리
             if not args.copy:
                 jf.unlink(missing_ok=True)
             continue
 
+        # 정규 대화 케이스
         for ci, conv in enumerate(convs, 1):
             base_title = slugify(conv["title"]) or slugify(jf.stem)
-            md = md_from_conv(conv)
-            parts = get_chunks(md, args.chunk_chars)
+            md_full = md_from_conv(conv)
+            parts = get_chunks(md_full, args.chunk_chars)
+
             for si, ch in enumerate(parts, 1):
-                name = f"{date_prefix}{base_title}"
-                if len(convs) > 1: name += f"-{ci}"
-                if len(parts) > 1: name += f"-part{si}"
-                name += ".md"
+                name = f"{date_prefix}"
+                if len(convs) > 1: name += f"_{ci:03d}"
+                if len(parts) > 1: name += f"_part{si:02d}"
+                name += f"_{base_title}.md"
+
                 target = ensure_unique(notes_dir / name)
-                extra = {"created": conv.get("created", now_iso())}
-                target.write_text(build_fm(conv["title"], jf.name, extra) + ch, encoding="utf-8")
+                extra = {"created": conv.get("created", now_iso()), "original_filename": jf.name}
+                fm = build_fm_dict(conv["title"], jf.name, extra)
+
+                # 요약/태그
+                if args.summarize:
+                    _, summary = summarize_block_kor(ch, model=args.model)
+                    fm["summary"] = summary
+                if args.auto_tags:
+                    fm["tags"] = infer_tags(ch, manual_tags)
+                elif manual_tags:
+                    fm["tags"] = manual_tags
+
+                target.write_text(dump_frontmatter(fm) + ch, encoding="utf-8")
                 print(f"[대화노트] {jf.name} → {target.relative_to(vault_dir)}")
                 processed += 1
+
         if not args.copy:
             jf.unlink(missing_ok=True)
 
-    # 2) 첨부/기타 파일 이동 (이 단계까지 오면 JSON 에러로 죽지 않음)
+    # 2) 첨부/기타 파일 이동
     for src in src_dir.iterdir():
         if src.is_dir(): continue
         ext = src.suffix.lower()
-        if ext == ".json":  # 이미 처리함
+        if ext == ".json":
             continue
         if ext in ATTACHMENT_EXTS or ext not in TEXTLIKE_EXTS:
             dst = ensure_unique(attach_dir / f"{date_prefix}{src.name}")
@@ -309,13 +453,12 @@ def main():
             print(f"[첨부] {src.name} → {dst.relative_to(vault_dir)}")
             if args.embed_for_attachments:
                 stub = ensure_unique(notes_dir / f"{date_prefix}{slugify(src.stem)}.md")
-                body = build_fm(slugify(src.stem), src.name, {"tags":["chatgpt","attachment"]})
+                fm = build_fm_dict(slugify(src.stem), src.name, {"tags":["chatgpt","attachment"]})
                 rel = str(dst.relative_to(vault_dir)).replace("\\","/")
-                stub.write_text(body + f"![[{rel}]]\n", encoding="utf-8")
+                stub.write_text(dump_frontmatter(fm) + f"![[{rel}]]\n", encoding="utf-8")
                 print(f"[임베드노트] {stub.relative_to(vault_dir)}")
                 processed += 1
         else:
-            # .md/.txt 등은 손대지 않음
             pass
 
     print(f"\n완료. 생성/이동된 항목: {processed}")
