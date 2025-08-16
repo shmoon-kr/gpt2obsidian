@@ -2,7 +2,7 @@
 # gpt2obsidian_simple.py
 # 목적: ChatGPT 내보내기 JSON → "대화별 작은 md 파일"로 쪼개어 Obsidian에 넣기
 #      그 외 파일은 첨부 폴더로 이동. 거대 합본 파일 절대 생성 안 함.
-# ex) python .\gpt2obsidian.py --src "E:\OneDrive\ChatbotGame\GPT\Threads\20250815" --prefix-date --copy --subfolder "Archive\\ChatGPT_20250815" --attachments "_attachments\\"
+# ex) python .\gpt2obsidian.py --src "E:\OneDrive\ChatbotGame\GPT\Threads\20250815" --prefix-date --copy --subfolder "Archive\\ChatGPT_20250815" --attachments "_attachments\\" --summarize --model gpt-4o-mini --auto-tags
 # ap.add_argument("--vault", default="G:\\내 드라이브\\Obsidian\\DarkLord\\", help="Obsidian Vault 루트 경로")
 
 #!/usr/bin/env python3
@@ -416,7 +416,7 @@ def main():
 
             for si, ch in enumerate(parts, 1):
                 name = f"{date_prefix}"
-                if len(convs) > 1: name += f"_{ci:03d}"
+                if len(convs) > 1: name += f"{ci:03d}"
                 if len(parts) > 1: name += f"_part{si:02d}"
                 name += f"_{base_title}.md"
 
